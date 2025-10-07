@@ -1,0 +1,467 @@
+pipeline {
+    agent any
+    
+    environment {
+        DOCKER_REGISTRY = 'localhost:5000'
+        KUBECONFIG = credentials('kubeconfig')
+        GITHUB_TOKEN = credentials('github-token')
+        DOCKER_BUILDKIT = '1'
+        IMAGE_TAG = "${BUILD_NUMBER}"
+        GIT_COMMIT_SHORT = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+    }
+    
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+    }
+    
+    triggers {
+        githubPush()
+        pollSCM('H/5 * * * *')
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                echo '📥 Checking out source code...'
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    env.BUILD_VERSION = "${IMAGE_TAG}-${GIT_COMMIT_SHORT}"
+                }
+            }
+        }
+        
+        stage('Environment Setup') {
+            steps {
+                echo '🔧 Setting up build environment...'
+                sh '''
+                    # Ensure Docker is running
+                    docker version
+                    
+                    # Set up minikube docker environment
+                    eval $(minikube docker-env)
+                    
+                    # Create build directories
+                    mkdir -p build-logs
+                    mkdir -p test-results
+                    mkdir -p security-reports
+                '''
+            }
+        }
+        
+        stage('Install Dependencies') {
+            parallel {
+                stage('Frontend Dependencies') {
+                    steps {
+                        dir('services/frontend') {
+                            echo '📦 Installing frontend dependencies...'
+                            sh '''
+                                npm ci
+                                npm audit --audit-level high
+                            '''
+                        }
+                    }
+                }
+                stage('Backend Dependencies') {
+                    steps {
+                        dir('services/backend') {
+                            echo '📦 Installing backend dependencies...'
+                            sh '''
+                                npm ci
+                                npm audit --audit-level high
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Code Quality & Security') {
+            parallel {
+                stage('Lint Frontend') {
+                    steps {
+                        dir('services/frontend') {
+                            echo '🔍 Linting frontend code...'
+                            sh '''
+                                npm run lint -- --format junit --output-file ../../test-results/frontend-lint.xml || true
+                            '''
+                        }
+                    }
+                }
+                stage('Lint Backend') {
+                    steps {
+                        dir('services/backend') {
+                            echo '🔍 Linting backend code...'
+                            sh '''
+                                npx eslint . --format junit --output-file ../../test-results/backend-lint.xml || true
+                            '''
+                        }
+                    }
+                }
+                stage('Security Scan') {
+                    steps {
+                        echo '🔒 Running security scans...'
+                        sh '''
+                            # Install security tools
+                            npm install -g audit-ci
+                            
+                            # Run security audits
+                            cd services/frontend && audit-ci --moderate || true
+                            cd ../backend && audit-ci --moderate || true
+                            
+                            # Dockerfile security scan with hadolint
+                            docker run --rm -i hadolint/hadolint < services/frontend/Dockerfile > security-reports/frontend-dockerfile.txt || true
+                            docker run --rm -i hadolint/hadolint < services/backend/Dockerfile > security-reports/backend-dockerfile.txt || true
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Test') {
+            parallel {
+                stage('Frontend Tests') {
+                    steps {
+                        dir('services/frontend') {
+                            echo '🧪 Running frontend tests...'
+                            sh '''
+                                CI=true npm test -- --coverage --watchAll=false --testResultsProcessor=jest-junit
+                                mkdir -p ../../test-results
+                                cp junit.xml ../../test-results/frontend-tests.xml || true
+                            '''
+                        }
+                    }
+                    post {
+                        always {
+                            publishHTML([
+                                allowMissing: false,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: 'services/frontend/coverage/lcov-report',
+                                reportFiles: 'index.html',
+                                reportName: 'Frontend Coverage Report'
+                            ])
+                        }
+                    }
+                }
+                stage('Backend Tests') {
+                    steps {
+                        dir('services/backend') {
+                            echo '🧪 Running backend tests...'
+                            sh '''
+                                npm test -- --coverage --testResultsProcessor=jest-junit
+                                mkdir -p ../../test-results
+                                cp junit.xml ../../test-results/backend-tests.xml || true
+                            '''
+                        }
+                    }
+                    post {
+                        always {
+                            publishHTML([
+                                allowMissing: false,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: 'services/backend/coverage/lcov-report',
+                                reportFiles: 'index.html',
+                                reportName: 'Backend Coverage Report'
+                            ])
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Build Images') {
+            parallel {
+                stage('Build Frontend') {
+                    steps {
+                        dir('services/frontend') {
+                            echo '🐳 Building frontend Docker image...'
+                            script {
+                                def image = docker.build("${DOCKER_REGISTRY}/capstone/frontend:${BUILD_VERSION}")
+                                docker.withRegistry("http://${DOCKER_REGISTRY}") {
+                                    image.push()
+                                    image.push("latest")
+                                }
+                            }
+                        }
+                    }
+                }
+                stage('Build Backend') {
+                    steps {
+                        dir('services/backend') {
+                            echo '🐳 Building backend Docker image...'
+                            script {
+                                def image = docker.build("${DOCKER_REGISTRY}/capstone/backend:${BUILD_VERSION}")
+                                docker.withRegistry("http://${DOCKER_REGISTRY}") {
+                                    image.push()
+                                    image.push("latest")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Container Security Scan') {
+            parallel {
+                stage('Scan Frontend Image') {
+                    steps {
+                        echo '🔍 Scanning frontend container for vulnerabilities...'
+                        sh """
+                            # Install Trivy if not available
+                            which trivy || (
+                                curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+                            )
+                            
+                            # Scan frontend image
+                            trivy image --exit-code 0 --no-progress --format json --output security-reports/frontend-trivy.json ${DOCKER_REGISTRY}/capstone/frontend:${BUILD_VERSION}
+                            trivy image --exit-code 1 --severity HIGH,CRITICAL --no-progress ${DOCKER_REGISTRY}/capstone/frontend:${BUILD_VERSION} || true
+                        """
+                    }
+                }
+                stage('Scan Backend Image') {
+                    steps {
+                        echo '🔍 Scanning backend container for vulnerabilities...'
+                        sh """
+                            trivy image --exit-code 0 --no-progress --format json --output security-reports/backend-trivy.json ${DOCKER_REGISTRY}/capstone/backend:${BUILD_VERSION}
+                            trivy image --exit-code 1 --severity HIGH,CRITICAL --no-progress ${DOCKER_REGISTRY}/capstone/backend:${BUILD_VERSION} || true
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Integration Tests') {
+            steps {
+                echo '🔗 Running integration tests...'
+                sh '''
+                    # Deploy test environment
+                    kubectl create namespace test-${BUILD_NUMBER} || true
+                    
+                    # Deploy MongoDB for testing
+                    kubectl run mongodb-test --image=mongo:6.0 --port=27017 -n test-${BUILD_NUMBER}
+                    kubectl expose pod mongodb-test --port=27017 -n test-${BUILD_NUMBER}
+                    
+                    # Wait for MongoDB to be ready
+                    kubectl wait --for=condition=Ready pod/mongodb-test -n test-${BUILD_NUMBER} --timeout=60s
+                    
+                    # Deploy backend for testing
+                    kubectl run backend-test --image=${DOCKER_REGISTRY}/capstone/backend:${BUILD_VERSION} --port=3000 -n test-${BUILD_NUMBER} \\
+                        --env="MONGODB_URI=mongodb://mongodb-test:27017/test"
+                    kubectl expose pod backend-test --port=3000 -n test-${BUILD_NUMBER}
+                    
+                    # Wait for backend to be ready
+                    kubectl wait --for=condition=Ready pod/backend-test -n test-${BUILD_NUMBER} --timeout=60s
+                    
+                    # Run API tests
+                    kubectl run api-test --image=appropriate/curl --rm -i --restart=Never -n test-${BUILD_NUMBER} -- \\
+                        sh -c "curl -f http://backend-test:3000/health && echo 'API Health Check Passed'"
+                '''
+            }
+            post {
+                always {
+                    sh '''
+                        # Cleanup test environment
+                        kubectl delete namespace test-${BUILD_NUMBER} || true
+                    '''
+                }
+            }
+        }
+        
+        stage('Update GitOps Repository') {
+            when {
+                branch 'main'
+            }
+            steps {
+                echo '📝 Updating GitOps repository...'
+                script {
+                    withCredentials([string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')]) {
+                        sh """
+                            # Configure Git
+                            git config user.name "Jenkins CI"
+                            git config user.email "jenkins@capstone.local"
+                            
+                            # Update image tags in Helm values
+                            sed -i 's|tag: .*|tag: "${BUILD_VERSION}"|g' helm-charts/frontend/values.yaml
+                            sed -i 's|tag: .*|tag: "${BUILD_VERSION}"|g' helm-charts/backend/values.yaml
+                            
+                            # Update timestamp in ConfigMap
+                            echo "  deployment.timestamp: '$(date -u +%Y-%m-%dT%H:%M:%SZ)'" >> helm-charts/frontend/values.yaml
+                            echo "  deployment.timestamp: '$(date -u +%Y-%m-%dT%H:%M:%SZ)'" >> helm-charts/backend/values.yaml
+                            
+                            # Commit changes
+                            if git diff --quiet; then
+                                echo "No changes to commit"
+                            else
+                                git add helm-charts/*/values.yaml
+                                git commit -m "🚀 Deploy: Update image tags to ${BUILD_VERSION}
+                                
+                                - Frontend: capstone/frontend:${BUILD_VERSION}
+                                - Backend: capstone/backend:${BUILD_VERSION}
+                                - Build: ${BUILD_NUMBER}
+                                - Commit: ${GIT_COMMIT_SHORT}
+                                - Pipeline: ${BUILD_URL}"
+                                
+                                git push https://${GITHUB_TOKEN}@github.com/your-org/capstone-01.git HEAD:main
+                            fi
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Performance Tests') {
+            when {
+                branch 'main'
+            }
+            steps {
+                echo '⚡ Running performance tests...'
+                sh '''
+                    # Install k6 for load testing
+                    curl -s https://github.com/grafana/k6/releases/download/v0.45.0/k6-v0.45.0-linux-amd64.tar.gz | tar xzf - --strip-components 1
+                    
+                    # Create simple load test
+                    cat > load-test.js << 'EOF'
+                    import http from 'k6/http';
+                    import { check, sleep } from 'k6';
+                    
+                    export const options = {
+                        stages: [
+                            { duration: '30s', target: 10 },
+                            { duration: '1m', target: 10 },
+                            { duration: '30s', target: 0 },
+                        ],
+                    };
+                    
+                    export default function() {
+                        const response = http.get('http://backend-service.capstone.svc.cluster.local:3000/health');
+                        check(response, {
+                            'status is 200': (r) => r.status === 200,
+                            'response time < 500ms': (r) => r.timings.duration < 500,
+                        });
+                        sleep(1);
+                    }
+                    EOF
+                    
+                    # Run load test (if cluster is available)
+                    ./k6 run --out json=test-results/performance.json load-test.js || echo "Performance test skipped - cluster not available"
+                '''
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo '📊 Publishing test results...'
+            
+            // Publish test results
+            publishTestResults([
+                testResultsPattern: 'test-results/*.xml',
+                allowEmptyResults: true
+            ])
+            
+            // Archive artifacts
+            archiveArtifacts([
+                artifacts: 'test-results/*, security-reports/*, build-logs/*',
+                allowEmptyArchive: true
+            ])
+            
+            // Clean workspace
+            cleanWs([
+                cleanWhenNotBuilt: false,
+                deleteDirs: true,
+                disableDeferredWipeout: true,
+                notFailBuild: true
+            ])
+        }
+        
+        success {
+            echo '✅ Pipeline completed successfully!'
+            
+            // Send success notification
+            script {
+                def message = """
+🎉 **Build Successful** - ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                
+**Changes:**
+- Frontend: `capstone/frontend:${BUILD_VERSION}`
+- Backend: `capstone/backend:${BUILD_VERSION}`
+- Commit: `${GIT_COMMIT_SHORT}`
+
+**Next Steps:**
+- ArgoCD will automatically deploy to staging
+- Monitor deployment in Grafana dashboards
+- Review test results: ${env.BUILD_URL}testReport/
+
+**Links:**
+- 📊 [Test Results](${env.BUILD_URL}testReport/)
+- 📈 [Coverage Reports](${env.BUILD_URL}HTML_20Report/)
+- 🔍 [Security Reports](${env.BUILD_URL}artifact/security-reports/)
+"""
+                
+                // Uncomment to enable Slack notifications
+                // slackSend(
+                //     channel: '#devops',
+                //     color: 'good',
+                //     message: message
+                // )
+                
+                echo message
+            }
+        }
+        
+        failure {
+            echo '❌ Pipeline failed!'
+            
+            script {
+                def message = """
+🚨 **Build Failed** - ${env.JOB_NAME} #${env.BUILD_NUMBER}
+
+**Failed Stage:** ${env.STAGE_NAME}
+**Error:** Check the build logs for details
+
+**Actions Required:**
+- Review build logs: ${env.BUILD_URL}console
+- Check test results: ${env.BUILD_URL}testReport/
+- Fix issues and retry build
+
+**Links:**
+- 📋 [Build Logs](${env.BUILD_URL}console)
+- 🔍 [Test Results](${env.BUILD_URL}testReport/)
+"""
+                
+                // Uncomment to enable Slack notifications
+                // slackSend(
+                //     channel: '#devops',
+                //     color: 'danger',
+                //     message: message
+                // )
+                
+                echo message
+            }
+        }
+        
+        unstable {
+            echo '⚠️ Pipeline completed with warnings!'
+            
+            script {
+                def message = """
+⚠️ **Build Unstable** - ${env.JOB_NAME} #${env.BUILD_NUMBER}
+
+Some tests failed but build continued.
+Please review the test results and fix failing tests.
+
+**Links:**
+- 📋 [Build Logs](${env.BUILD_URL}console)
+- 🔍 [Test Results](${env.BUILD_URL}testReport/)
+"""
+                
+                echo message
+            }
+        }
+    }
+}

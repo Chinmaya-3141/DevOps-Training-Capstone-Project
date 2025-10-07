@@ -1,0 +1,336 @@
+---
+- name: Setup Kubernetes cluster for DevOps capstone project
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    terraform_dir: "../terraform"
+    kubectl_context: "minikube"
+    argocd_version: "v2.7.4"
+    prometheus_version: "51.2.0"
+    
+  pre_tasks:
+    - name: Verify prerequisites
+      block:
+        - name: Check if kubectl is installed
+          command: kubectl version --client
+          register: kubectl_check
+          failed_when: false
+          
+        - name: Check if helm is installed
+          command: helm version
+          register: helm_check
+          failed_when: false
+          
+        - name: Check if terraform is installed
+          command: terraform version
+          register: terraform_check
+          failed_when: false
+          
+        - name: Verify minikube is running
+          command: minikube status
+          register: minikube_check
+          failed_when: false
+          
+        - name: Display prerequisite check results
+          debug:
+            msg: |
+              kubectl: {{ 'OK' if kubectl_check.rc == 0 else 'MISSING' }}
+              helm: {{ 'OK' if helm_check.rc == 0 else 'MISSING' }}
+              terraform: {{ 'OK' if terraform_check.rc == 0 else 'MISSING' }}
+              minikube: {{ 'OK' if minikube_check.rc == 0 else 'NOT RUNNING' }}
+              
+        - name: Fail if prerequisites are not met
+          fail:
+            msg: "Please ensure all prerequisites are installed and minikube is running"
+          when: kubectl_check.rc != 0 or helm_check.rc != 0 or terraform_check.rc != 0 or minikube_check.rc != 0
+
+  tasks:
+    - name: Infrastructure Setup
+      block:
+        - name: Apply Terraform configuration
+          shell: |
+            cd {{ terraform_dir }}
+            terraform init
+            terraform plan -out=tfplan
+            terraform apply -auto-approve tfplan
+          register: terraform_result
+          
+        - name: Display Terraform output
+          debug:
+            var: terraform_result.stdout_lines
+
+    - name: Wait for namespaces to be ready
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: "{{ item }}"
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 300
+      loop:
+        - capstone
+        - monitoring
+        - argocd
+
+    - name: ArgoCD Installation
+      block:
+        - name: Install ArgoCD
+          kubernetes.core.k8s:
+            state: present
+            src: "https://raw.githubusercontent.com/argoproj/argo-cd/{{ argocd_version }}/manifests/install.yaml"
+            namespace: argocd
+            
+        - name: Wait for ArgoCD deployment
+          kubernetes.core.k8s_info:
+            api_version: apps/v1
+            kind: Deployment
+            namespace: argocd
+            name: argocd-server
+            wait: true
+            wait_condition:
+              type: Available
+              status: "True"
+            wait_timeout: 600
+            
+        - name: Create ArgoCD admin password secret
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: argocd-secret
+                namespace: argocd
+                labels:
+                  app.kubernetes.io/name: argocd-secret
+                  app.kubernetes.io/part-of: argocd
+              type: Opaque
+              data:
+                admin.password: "$2a$10$rRyBsGSHK6.uc8fntPwVIuLVHgsAhAX7TcdrqW/XhfIBB97T3nKNa"  # password
+                
+        - name: Patch ArgoCD server service to LoadBalancer
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: v1
+              kind: Service
+              metadata:
+                name: argocd-server
+                namespace: argocd
+              spec:
+                type: LoadBalancer
+                ports:
+                - name: https
+                  port: 443
+                  targetPort: 8080
+                - name: http
+                  port: 80
+                  targetPort: 8080
+                selector:
+                  app.kubernetes.io/name: argocd-server
+
+    - name: Monitoring Stack Installation
+      block:
+        - name: Add Helm repositories
+          kubernetes.core.helm_repository:
+            name: "{{ item.name }}"
+            repo_url: "{{ item.url }}"
+          loop:
+            - name: prometheus-community
+              url: https://prometheus-community.github.io/helm-charts
+            - name: grafana
+              url: https://grafana.github.io/helm-charts
+            - name: elastic
+              url: https://helm.elastic.co
+              
+        - name: Update Helm repositories
+          kubernetes.core.helm:
+            name: dummy
+            state: absent
+            
+        - name: Install Prometheus stack
+          kubernetes.core.helm:
+            name: prometheus
+            chart_ref: prometheus-community/kube-prometheus-stack
+            release_namespace: monitoring
+            create_namespace: true
+            values:
+              grafana:
+                adminPassword: "admin123"
+                service:
+                  type: LoadBalancer
+                dashboardProviders:
+                  dashboardproviders.yaml:
+                    apiVersion: 1
+                    providers:
+                    - name: 'default'
+                      orgId: 1
+                      folder: ''
+                      type: file
+                      disableDeletion: false
+                      editable: true
+                      options:
+                        path: /var/lib/grafana/dashboards/default
+              prometheus:
+                prometheusSpec:
+                  storageSpec:
+                    volumeClaimTemplate:
+                      spec:
+                        accessModes: ["ReadWriteOnce"]
+                        resources:
+                          requests:
+                            storage: 5Gi
+                  retention: 7d
+                  additionalScrapeConfigs:
+                  - job_name: 'capstone-frontend'
+                    static_configs:
+                    - targets: ['frontend-service.capstone.svc.cluster.local:80']
+                  - job_name: 'capstone-backend'
+                    static_configs:
+                    - targets: ['backend-service.capstone.svc.cluster.local:3000']
+            wait: true
+            wait_timeout: 600
+            
+        - name: Wait for Prometheus stack to be ready
+          kubernetes.core.k8s_info:
+            api_version: apps/v1
+            kind: Deployment
+            namespace: monitoring
+            name: "{{ item }}"
+            wait: true
+            wait_condition:
+              type: Available
+              status: "True"
+            wait_timeout: 300
+          loop:
+            - prometheus-grafana
+            - prometheus-kube-prometheus-prometheus-operator
+
+    - name: Ingress Setup
+      block:
+        - name: Enable minikube ingress addon
+          shell: minikube addons enable ingress
+          
+        - name: Enable minikube metrics-server addon
+          shell: minikube addons enable metrics-server
+          
+        - name: Wait for ingress controller
+          kubernetes.core.k8s_info:
+            api_version: apps/v1
+            kind: Deployment
+            namespace: ingress-nginx
+            name: ingress-nginx-controller
+            wait: true
+            wait_condition:
+              type: Available
+              status: "True"
+            wait_timeout: 300
+
+    - name: Registry Setup
+      block:
+        - name: Enable minikube registry addon
+          shell: minikube addons enable registry
+          
+        - name: Wait for registry to be ready
+          kubernetes.core.k8s_info:
+            api_version: apps/v1
+            kind: Deployment
+            namespace: kube-system
+            name: registry
+            wait: true
+            wait_condition:
+              type: Available
+              status: "True"
+            wait_timeout: 300
+
+  post_tasks:
+    - name: Display setup completion information
+      debug:
+        msg: |
+          ===================================================
+          DevOps Capstone Kubernetes Setup Complete!
+          ===================================================
+          
+          Namespaces created:
+          - capstone (application)
+          - monitoring (Prometheus, Grafana)
+          - argocd (GitOps)
+          
+          Services installed:
+          - ArgoCD (GitOps workflow)
+          - Prometheus (Metrics collection)
+          - Grafana (Visualization)
+          - Ingress Controller (Traffic routing)
+          - Registry (Local Docker registry)
+          
+          Access Information:
+          - Grafana: kubectl port-forward -n monitoring svc/prometheus-grafana 3000:80
+            Username: admin, Password: admin123
+          - ArgoCD: kubectl port-forward -n argocd svc/argocd-server 8080:80
+            Username: admin, Password: password
+          - Prometheus: kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 9090:9090
+          
+          Next Steps:
+          1. Build and push your application images
+          2. Deploy applications using Helm charts
+          3. Configure ArgoCD applications for GitOps
+          4. Set up monitoring dashboards in Grafana
+          
+          Useful Commands:
+          - Check all pods: kubectl get pods --all-namespaces
+          - Get minikube IP: minikube ip
+          - Access minikube dashboard: minikube dashboard
+          ===================================================
+          
+    - name: Save important information to file
+      copy:
+        content: |
+          # DevOps Capstone - Important Information
+          
+          ## Access URLs (use minikube tunnel for LoadBalancer services)
+          - Grafana: http://localhost:3000 (admin/admin123)
+          - ArgoCD: http://localhost:8080 (admin/password)
+          - Prometheus: http://localhost:9090
+          
+          ## Port Forward Commands
+          ```bash
+          # Grafana
+          kubectl port-forward -n monitoring svc/prometheus-grafana 3000:80
+          
+          # ArgoCD
+          kubectl port-forward -n argocd svc/argocd-server 8080:80
+          
+          # Prometheus
+          kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 9090:9090
+          ```
+          
+          ## Minikube Commands
+          ```bash
+          # Get cluster IP
+          minikube ip
+          
+          # Enable tunnel for LoadBalancer services
+          minikube tunnel
+          
+          # Access dashboard
+          minikube dashboard
+          
+          # Check addons
+          minikube addons list
+          ```
+          
+          ## Kubectl Commands
+          ```bash
+          # Get all resources
+          kubectl get all --all-namespaces
+          
+          # Check pod logs
+          kubectl logs -f <pod-name> -n <namespace>
+          
+          # Execute commands in pod
+          kubectl exec -it <pod-name> -n <namespace> -- /bin/bash
+          ```
+        dest: "{{ playbook_dir }}/setup-info.md"

@@ -1,0 +1,97 @@
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Build outputs
+build/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Logs
+logs
+*.log
+loglevel=silent
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Docker
+.dockerignore
+
+# Kubernetes
+kubeconfig
+*.kubeconfig
+
+# Terraform
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform/
+.terraform.lock.hcl
+terraform.tfplan
+
+# Ansible
+*.retry
+
+# Helm
+*.tgz
+
+# Secrets and certificates
+*.pem
+*.key
+*.crt
+*.csr
+secrets.yaml
+*-secret.yaml
+
+# Monitoring
+prometheus-data/
+grafana-data/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Test files
+test-results/
+coverage/
+
+# Local development
+.local/
+*.local
+
+# Backup files
+*.backup
+*.bak
